@@ -17,7 +17,7 @@ import os
 import logging
 from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -31,6 +31,7 @@ from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, APIC, ID3NoHeaderError
 from mutagen.flac import FLAC, Picture
 from mutagen.mp4 import MP4, MP4Cover
+from PIL import Image
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -65,6 +66,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Пришли мне аудиофайл (mp3, flac или m4a), "
         "и я помогу поменять у него название, исполнителя и обложку."
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Как пользоваться:\n"
+        "1. Пришли аудиофайл (mp3, flac или m4a)\n"
+        "2. Кнопками выбери, что поменять: название, исполнителя, обложку\n"
+        "3. Пришли новое значение (текст или фото)\n"
+        "4. Нажми «Готово» — получишь файл с новыми тегами"
     )
 
 
@@ -220,6 +231,17 @@ def apply_mp4_tags(path: str, title, artist, cover_path):
     audio.save()
 
 
+def make_thumbnail(cover_path: str) -> str:
+    """Делает уменьшенную JPEG-версию обложки (до 320x320, <200 КБ) —
+    именно такую картинку Telegram показывает как превью аудио в чате."""
+    thumb_path = str(Path(cover_path).with_name("thumb.jpg"))
+    with Image.open(cover_path) as img:
+        img = img.convert("RGB")
+        img.thumbnail((320, 320))
+        img.save(thumb_path, "JPEG", quality=85)
+    return thumb_path
+
+
 async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
     file_path = context.user_data.get("file_path")
     ext = context.user_data.get("ext")
@@ -244,18 +266,41 @@ async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     await query.edit_message_text("Готово! Отправляю файл...")
+
+    thumb_path = None
+    if cover_path and os.path.exists(cover_path):
+        try:
+            thumb_path = make_thumbnail(cover_path)
+        except Exception:
+            logger.exception("Не удалось сделать миниатюру обложки")
+
     with open(file_path, "rb") as f:
-        await context.bot.send_audio(
-            chat_id=update.effective_chat.id,
-            audio=f,
-            title=title or None,
-            performer=artist or None,
-            filename=Path(file_path).name,
-        )
+        thumb_file = open(thumb_path, "rb") if thumb_path else None
+        try:
+            await context.bot.send_audio(
+                chat_id=update.effective_chat.id,
+                audio=f,
+                title=title or None,
+                performer=artist or None,
+                filename=Path(file_path).name,
+                thumbnail=thumb_file,
+            )
+        finally:
+            if thumb_file:
+                thumb_file.close()
 
     # очистка состояния пользователя
     for key in ("file_path", "ext", "new_title", "new_artist", "cover_path", "state"):
         context.user_data.pop(key, None)
+
+
+async def setup_commands(application: Application):
+    await application.bot.set_my_commands(
+        [
+            BotCommand("start", "Начать / отправить новый файл"),
+            BotCommand("help", "Как пользоваться ботом"),
+        ]
+    )
 
 
 def main():
@@ -265,9 +310,10 @@ def main():
             "с токеном от @BotFather перед запуском."
         )
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(setup_commands).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
