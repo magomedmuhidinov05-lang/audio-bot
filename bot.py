@@ -107,12 +107,14 @@ async def handle_forwarded_channel(update: Update, context: ContextTypes.DEFAULT
     if context.user_data.get("state") != STATE_SET_CHANNEL:
         return  # не в процессе привязки канала — игнорируем
 
-    chat = update.message.forward_from_chat
-    if chat is None or chat.type != "channel":
+    origin = update.message.forward_origin
+    if origin is None or origin.type != "channel":
         await update.message.reply_text(
             "Это не похоже на пересланное сообщение из канала. Попробуй ещё раз."
         )
         return
+
+    chat = origin.chat
 
     try:
         member = await context.bot.get_chat_member(chat.id, context.bot.id)
