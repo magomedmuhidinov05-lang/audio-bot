@@ -25,6 +25,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    PicklePersistence,
 )
 
 from mutagen.mp3 import MP3
@@ -42,12 +43,14 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 WORK_DIR = Path("bot_files")
 WORK_DIR.mkdir(exist_ok=True)
+PERSISTENCE_FILE = "bot_persistence.pkl"
 
 # Состояния, которые бот ждёт от пользователя дальше
 STATE_NONE = "none"
 STATE_TITLE = "title"
 STATE_ARTIST = "artist"
 STATE_COVER = "cover"
+STATE_SET_CHANNEL = "set_channel"
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -75,8 +78,57 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Пришли аудиофайл (mp3, flac или m4a)\n"
         "2. Кнопками выбери, что поменять: название, исполнителя, обложку\n"
         "3. Пришли новое значение (текст или фото)\n"
-        "4. Нажми «Готово» — получишь файл с новыми тегами"
+        "4. Нажми «Готово» — получишь файл с новыми тегами\n\n"
+        "Чтобы можно было постить сразу на свой канал:\n"
+        "/setchannel — привязать канал\n"
+        "/mychannel — посмотреть, какой канал сейчас привязан"
     )
+
+
+async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["state"] = STATE_SET_CHANNEL
+    await update.message.reply_text(
+        "1. Добавь этого бота администратором в свой канал (с правом публикации постов)\n"
+        "2. Перешли мне сюда любое сообщение из этого канала — я запомню его"
+    )
+
+
+async def cmd_mychannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    channel_title = context.user_data.get("channel_title")
+    if channel_title:
+        await update.message.reply_text(f"Привязан канал: {channel_title}")
+    else:
+        await update.message.reply_text(
+            "Канал ещё не привязан. Используй /setchannel, чтобы привязать."
+        )
+
+
+async def handle_forwarded_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("state") != STATE_SET_CHANNEL:
+        return  # не в процессе привязки канала — игнорируем
+
+    chat = update.message.forward_from_chat
+    if chat is None or chat.type != "channel":
+        await update.message.reply_text(
+            "Это не похоже на пересланное сообщение из канала. Попробуй ещё раз."
+        )
+        return
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, context.bot.id)
+        if member.status not in ("administrator", "creator"):
+            raise ValueError("not admin")
+    except Exception:
+        await update.message.reply_text(
+            "Не вижу бота среди администраторов этого канала. "
+            "Добавь его туда с правом публикации и попробуй снова."
+        )
+        return
+
+    context.user_data["channel_id"] = chat.id
+    context.user_data["channel_title"] = chat.title
+    context.user_data["state"] = STATE_NONE
+    await update.message.reply_text(f"Готово! Канал «{chat.title}» привязан ✅")
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -116,7 +168,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if "file_path" not in context.user_data:
+    if "file_path" not in context.user_data and query.data != "send_channel":
         await query.edit_message_text("Сначала пришли аудиофайл командой /start.")
         return
 
@@ -131,6 +183,37 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Пришли фото для обложки.")
     elif query.data == "finish":
         await apply_tags_and_send(update, context, query)
+    elif query.data == "send_channel":
+        await send_to_channel(update, context, query)
+
+
+async def send_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
+    file_id = context.user_data.get("last_file_id")
+    channel_id = context.user_data.get("channel_id")
+
+    if not file_id:
+        await query.edit_message_text("Файл не найден, пришли аудио заново.")
+        return
+    if not channel_id:
+        await query.edit_message_text(
+            "У тебя ещё не привязан канал. Используй /setchannel, чтобы привязать его."
+        )
+        return
+
+    try:
+        await context.bot.send_audio(
+            chat_id=channel_id,
+            audio=file_id,
+            title=context.user_data.get("last_title") or None,
+            performer=context.user_data.get("last_artist") or None,
+        )
+        await query.edit_message_text("✅ Отправлено на твой канал!")
+    except Exception as e:
+        logger.exception("Ошибка при отправке в канал")
+        await query.edit_message_text(
+            f"Не получилось отправить в канал: {e}\n"
+            "Проверь, что бот всё ещё администратор канала."
+        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -277,7 +360,7 @@ async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE
     with open(file_path, "rb") as f:
         thumb_file = open(thumb_path, "rb") if thumb_path else None
         try:
-            await context.bot.send_audio(
+            sent_message = await context.bot.send_audio(
                 chat_id=update.effective_chat.id,
                 audio=f,
                 title=title or None,
@@ -289,7 +372,21 @@ async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE
             if thumb_file:
                 thumb_file.close()
 
-    # очистка состояния пользователя
+    if context.user_data.get("channel_id"):
+        # сохраняем file_id готового файла, чтобы отправить его в канал без
+        # повторной загрузки, если пользователь нажмёт кнопку ниже
+        context.user_data["last_file_id"] = sent_message.audio.file_id
+        context.user_data["last_title"] = title
+        context.user_data["last_artist"] = artist
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="Запостить этот файл на твой канал?",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📢 Отправить на канал", callback_data="send_channel")]]
+            ),
+        )
+
+    # очистка состояния пользователя (кроме last_* — они нужны для кнопки канала)
     for key in ("file_path", "ext", "new_title", "new_artist", "cover_path", "state"):
         context.user_data.pop(key, None)
 
@@ -299,6 +396,8 @@ async def setup_commands(application: Application):
         [
             BotCommand("start", "Начать / отправить новый файл"),
             BotCommand("help", "Как пользоваться ботом"),
+            BotCommand("setchannel", "Привязать свой канал"),
+            BotCommand("mychannel", "Какой канал привязан сейчас"),
         ]
     )
 
@@ -310,13 +409,23 @@ def main():
             "с токеном от @BotFather перед запуском."
         )
 
-    app = Application.builder().token(BOT_TOKEN).post_init(setup_commands).build()
+    persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .persistence(persistence)
+        .post_init(setup_commands)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("setchannel", cmd_setchannel))
+    app.add_handler(CommandHandler("mychannel", cmd_mychannel))
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded_channel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     logger.info("Бот запущен...")
