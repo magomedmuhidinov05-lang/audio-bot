@@ -33,6 +33,7 @@ from mutagen.id3 import ID3, TIT2, TPE1, APIC, ID3NoHeaderError
 from mutagen.flac import FLAC, Picture
 from mutagen.mp4 import MP4, MP4Cover
 from PIL import Image
+import httpx
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -41,6 +42,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN", "")  # ключ с audd.io, для распознавания треков
 WORK_DIR = Path("bot_files")
 WORK_DIR.mkdir(exist_ok=True)
 PERSISTENCE_FILE = "bot_persistence.pkl"
@@ -60,9 +62,31 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🎤 Исполнитель", callback_data="set_artist"),
         ],
         [InlineKeyboardButton("🖼 Обложка", callback_data="set_cover")],
-        [InlineKeyboardButton("✅ Готово, отправить файл", callback_data="finish")],
     ]
+    if AUDD_API_TOKEN:
+        buttons.append(
+            [InlineKeyboardButton("🔍 Определить трек по звуку", callback_data="recognize")]
+        )
+    buttons.append([InlineKeyboardButton("✅ Готово, отправить файл", callback_data="finish")])
     return InlineKeyboardMarkup(buttons)
+
+
+async def recognize_track(file_path: str) -> dict | None:
+    """Отправляет аудио в AudD.io и возвращает {'title':..., 'artist':...} или None."""
+    if not AUDD_API_TOKEN:
+        return None
+    async with httpx.AsyncClient(timeout=30) as client:
+        with open(file_path, "rb") as f:
+            response = await client.post(
+                "https://api.audd.io/",
+                data={"api_token": AUDD_API_TOKEN, "return": ""},
+                files={"file": f},
+            )
+    data = response.json()
+    result = data.get("result")
+    if not result:
+        return None
+    return {"title": result.get("title"), "artist": result.get("artist")}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -83,6 +107,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/setchannel — привязать канал\n"
         "/mychannel — посмотреть, какой канал сейчас привязан"
     )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    had_file = "file_path" in context.user_data
+    for key in (
+        "file_path", "ext", "new_title", "new_artist", "cover_path",
+        "state", "last_file_id", "last_title", "last_artist",
+    ):
+        context.user_data.pop(key, None)
+    if had_file:
+        await update.message.reply_text("Отменено. Можешь прислать новый файл.")
+    else:
+        await update.message.reply_text("Отменять нечего, но состояние на всякий случай сброшено.")
 
 
 async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -187,6 +224,43 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await apply_tags_and_send(update, context, query)
     elif query.data == "send_channel":
         await send_to_channel(update, context, query)
+    elif query.data == "recognize":
+        await handle_recognize(update, context, query)
+
+
+async def handle_recognize(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
+    file_path = context.user_data.get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        await query.edit_message_text("Файл не найден, пришли аудио заново.")
+        return
+
+    await query.edit_message_text("Слушаю трек, определяю...")
+    try:
+        result = await recognize_track(file_path)
+    except Exception as e:
+        logger.exception("Ошибка распознавания трека")
+        await query.edit_message_text(
+            f"Не получилось распознать трек: {e}", reply_markup=main_menu_keyboard()
+        )
+        return
+
+    if not result:
+        await query.edit_message_text(
+            "Не удалось распознать этот трек. Можешь ввести название и исполнителя вручную.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if result.get("title"):
+        context.user_data["new_title"] = result["title"]
+    if result.get("artist"):
+        context.user_data["new_artist"] = result["artist"]
+
+    await query.edit_message_text(
+        f"Похоже, это:\n«{result.get('title')}» — {result.get('artist')}\n\n"
+        "Уже подставил в название и исполнителя. Можешь поправить или нажать «Готово».",
+        reply_markup=main_menu_keyboard(),
+    )
 
 
 async def send_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
@@ -398,6 +472,7 @@ async def setup_commands(application: Application):
         [
             BotCommand("start", "Начать / отправить новый файл"),
             BotCommand("help", "Как пользоваться ботом"),
+            BotCommand("cancel", "Отменить текущую операцию"),
             BotCommand("setchannel", "Привязать свой канал"),
             BotCommand("mychannel", "Какой канал привязан сейчас"),
         ]
@@ -422,6 +497,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("setchannel", cmd_setchannel))
     app.add_handler(CommandHandler("mychannel", cmd_mychannel))
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
@@ -430,8 +506,20 @@ def main():
     app.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded_channel))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    logger.info("Бот запущен...")
-    app.run_polling()
+    webhook_url = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+    if webhook_url:
+        port = int(os.environ.get("PORT", 8080))
+        logger.info("Бот запущен через webhook: %s", webhook_url)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=BOT_TOKEN,
+            webhook_url=f"{webhook_url}/{BOT_TOKEN}",
+            secret_token=os.environ.get("WEBHOOK_SECRET") or None,
+        )
+    else:
+        logger.info("Бот запущен через polling (WEBHOOK_URL не задан)...")
+        app.run_polling()
 
 
 if __name__ == "__main__":
