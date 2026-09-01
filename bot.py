@@ -14,6 +14,7 @@ Telegram-бот для редактирования тегов аудио (на�
 """
 
 import os
+import asyncio
 import logging
 from pathlib import Path
 
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN", "")  # ключ с audd.io, для распознавания треков
+ADMIN_ID = os.environ.get("ADMIN_ID", "")  # твой Telegram user id — для /broadcast
 WORK_DIR = Path("bot_files")
 WORK_DIR.mkdir(exist_ok=True)
 PERSISTENCE_FILE = "bot_persistence.pkl"
@@ -53,6 +55,15 @@ STATE_TITLE = "title"
 STATE_ARTIST = "artist"
 STATE_COVER = "cover"
 STATE_SET_CHANNEL = "set_channel"
+
+
+def remember_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запоминает user_id в общем хранилище бота, чтобы потом можно было
+    сделать рассылку всем, кто хоть раз писал боту."""
+    if not update.effective_user:
+        return
+    known = context.bot_data.setdefault("known_users", set())
+    known.add(update.effective_user.id)
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -90,6 +101,7 @@ async def recognize_track(file_path: str) -> dict | None:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remember_user(update, context)
     await update.message.reply_text(
         "Привет! Пришли мне аудиофайл (mp3, flac или m4a), "
         "и я помогу поменять у него название, исполнителя и обложку."
@@ -97,6 +109,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remember_user(update, context)
     await update.message.reply_text(
         "Как пользоваться:\n"
         "1. Пришли аудиофайл (mp3, flac или m4a)\n"
@@ -171,6 +184,7 @@ async def handle_forwarded_channel(update: Update, context: ContextTypes.DEFAULT
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remember_user(update, context)
     audio = update.message.audio or update.message.document
     if audio is None:
         await update.message.reply_text("Не вижу аудиофайл, попробуй ещё раз.")
@@ -467,6 +481,33 @@ async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data.pop(key, None)
 
 
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or str(update.effective_user.id) != str(ADMIN_ID):
+        return  # не админ — тихо игнорируем, чтобы не палить наличие команды
+
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text("Использование: /broadcast текст сообщения")
+        return
+
+    known_users = context.bot_data.get("known_users", set())
+    if not known_users:
+        await update.message.reply_text("Пока нет ни одного известного пользователя.")
+        return
+
+    sent, failed = 0, 0
+    status = await update.message.reply_text(f"Рассылаю {len(known_users)} пользователям...")
+    for user_id in list(known_users):
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # чтобы не упереться в лимиты Telegram
+
+    await status.edit_text(f"Готово: доставлено {sent}, не доставлено {failed}.")
+
+
 async def setup_commands(application: Application):
     await application.bot.set_my_commands(
         [
@@ -500,6 +541,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CommandHandler("setchannel", cmd_setchannel))
     app.add_handler(CommandHandler("mychannel", cmd_mychannel))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
