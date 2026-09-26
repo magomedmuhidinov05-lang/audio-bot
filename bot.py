@@ -4,7 +4,7 @@ Telegram-бот для редактирования тегов аудио (на�
 Поддерживаемые форматы: MP3, FLAC, M4A/MP4.
 
 Установка:
-    pip install python-telegram-bot mutagen
+    pip install -r requirements.txt
 
 Запуск:
     export BOT_TOKEN="твой_токен_от_BotFather"
@@ -118,7 +118,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "4. Нажми «Готово» — получишь файл с новыми тегами\n\n"
         "Чтобы можно было постить сразу на свой канал:\n"
         "/setchannel — привязать канал\n"
-        "/mychannel — посмотреть, какой канал сейчас привязан"
+        "/mychannel — посмотреть, какой канал сейчас привязан\n\n"
+        "/cancel — отменить текущую операцию"
     )
 
 
@@ -127,6 +128,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for key in (
         "file_path", "ext", "new_title", "new_artist", "cover_path",
         "state", "last_file_id", "last_title", "last_artist",
+        "original_title", "original_artist",
     ):
         context.user_data.pop(key, None)
     if had_file:
@@ -151,6 +153,33 @@ async def cmd_mychannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "Канал ещё не привязан. Используй /setchannel, чтобы привязать."
         )
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or str(update.effective_user.id) != str(ADMIN_ID):
+        return  # не админ — тихо игнорируем, чтобы не палить наличие команды
+
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text("Использование: /broadcast текст сообщения")
+        return
+
+    known_users = context.bot_data.get("known_users", set())
+    if not known_users:
+        await update.message.reply_text("Пока нет ни одного известного пользователя.")
+        return
+
+    sent, failed = 0, 0
+    status = await update.message.reply_text(f"Рассылаю {len(known_users)} пользователям...")
+    for user_id in list(known_users):
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # чтобы не упереться в лимиты Telegram
+
+    await status.edit_text(f"Готово: доставлено {sent}, не доставлено {failed}.")
 
 
 async def handle_forwarded_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -205,12 +234,22 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_file = await context.bot.get_file(audio.file_id)
     await tg_file.download_to_drive(custom_path=str(local_path))
 
+    # Запоминаем оригинальные название/исполнителя (Telegram хранит их отдельно
+    # от самого файла), чтобы не терять их, если пользователь меняет только обложку
+    orig_title = None
+    orig_artist = None
+    if update.message.audio:
+        orig_title = update.message.audio.title
+        orig_artist = update.message.audio.performer
+
     context.user_data["file_path"] = str(local_path)
     context.user_data["ext"] = ext
     context.user_data["state"] = STATE_NONE
     context.user_data["new_title"] = None
     context.user_data["new_artist"] = None
     context.user_data["cover_path"] = None
+    context.user_data["original_title"] = orig_title
+    context.user_data["original_artist"] = orig_artist
 
     await update.message.reply_text(
         "Файл получен! Что меняем?", reply_markup=main_menu_keyboard()
@@ -275,35 +314,6 @@ async def handle_recognize(update: Update, context: ContextTypes.DEFAULT_TYPE, q
         "Уже подставил в название и исполнителя. Можешь поправить или нажать «Готово».",
         reply_markup=main_menu_keyboard(),
     )
-
-
-async def send_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
-    file_id = context.user_data.get("last_file_id")
-    channel_id = context.user_data.get("channel_id")
-
-    if not file_id:
-        await query.edit_message_text("Файл не найден, пришли аудио заново.")
-        return
-    if not channel_id:
-        await query.edit_message_text(
-            "У тебя ещё не привязан канал. Используй /setchannel, чтобы привязать его."
-        )
-        return
-
-    try:
-        await context.bot.send_audio(
-            chat_id=channel_id,
-            audio=file_id,
-            title=context.user_data.get("last_title") or None,
-            performer=context.user_data.get("last_artist") or None,
-        )
-        await query.edit_message_text("✅ Отправлено на твой канал!")
-    except Exception as e:
-        logger.exception("Ошибка при отправке в канал")
-        await query.edit_message_text(
-            f"Не получилось отправить в канал: {e}\n"
-            "Проверь, что бот всё ещё администратор канала."
-        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -415,12 +425,44 @@ def make_thumbnail(cover_path: str) -> str:
     return thumb_path
 
 
+async def send_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
+    file_id = context.user_data.get("last_file_id")
+    channel_id = context.user_data.get("channel_id")
+
+    if not file_id:
+        await query.edit_message_text("Файл не найден, пришли аудио заново.")
+        return
+    if not channel_id:
+        await query.edit_message_text(
+            "У тебя ещё не привязан канал. Используй /setchannel, чтобы привязать его."
+        )
+        return
+
+    try:
+        await context.bot.send_audio(
+            chat_id=channel_id,
+            audio=file_id,
+            title=context.user_data.get("last_title") or None,
+            performer=context.user_data.get("last_artist") or None,
+        )
+        await query.edit_message_text("✅ Отправлено на твой канал!")
+    except Exception as e:
+        logger.exception("Ошибка при отправке в канал")
+        await query.edit_message_text(
+            f"Не получилось отправить в канал: {e}\n"
+            "Проверь, что бот всё ещё администратор канала."
+        )
+
+
 async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
     file_path = context.user_data.get("file_path")
     ext = context.user_data.get("ext")
-    title = context.user_data.get("new_title")
-    artist = context.user_data.get("new_artist")
     cover_path = context.user_data.get("cover_path")
+
+    # Если пользователь не менял название/исполнителя — сохраняем оригинальные
+    # значения (Telegram хранит их отдельно от самого файла), а не теряем их
+    title = context.user_data.get("new_title") or context.user_data.get("original_title")
+    artist = context.user_data.get("new_artist") or context.user_data.get("original_artist")
 
     if not file_path or not os.path.exists(file_path):
         await query.edit_message_text("Файл не найден, пришли аудио заново.")
@@ -477,35 +519,11 @@ async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
     # очистка состояния пользователя (кроме last_* — они нужны для кнопки канала)
-    for key in ("file_path", "ext", "new_title", "new_artist", "cover_path", "state"):
+    for key in (
+        "file_path", "ext", "new_title", "new_artist", "cover_path", "state",
+        "original_title", "original_artist",
+    ):
         context.user_data.pop(key, None)
-
-
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not ADMIN_ID or str(update.effective_user.id) != str(ADMIN_ID):
-        return  # не админ — тихо игнорируем, чтобы не палить наличие команды
-
-    text = update.message.text.partition(" ")[2].strip()
-    if not text:
-        await update.message.reply_text("Использование: /broadcast текст сообщения")
-        return
-
-    known_users = context.bot_data.get("known_users", set())
-    if not known_users:
-        await update.message.reply_text("Пока нет ни одного известного пользователя.")
-        return
-
-    sent, failed = 0, 0
-    status = await update.message.reply_text(f"Рассылаю {len(known_users)} пользователям...")
-    for user_id in list(known_users):
-        try:
-            await context.bot.send_message(chat_id=user_id, text=text)
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)  # чтобы не упереться в лимиты Telegram
-
-    await status.edit_text(f"Готово: доставлено {sent}, не доставлено {failed}.")
 
 
 async def setup_commands(application: Application):
