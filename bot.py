@@ -16,6 +16,7 @@ Telegram-бот для редактирования тегов аудио (на�
 import os
 import asyncio
 import logging
+import subprocess
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
@@ -35,6 +36,7 @@ from mutagen.flac import FLAC, Picture
 from mutagen.mp4 import MP4, MP4Cover
 from PIL import Image
 import httpx
+import imageio_ffmpeg
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -48,6 +50,7 @@ ADMIN_ID = os.environ.get("ADMIN_ID", "")  # твой Telegram user id — дл�
 WORK_DIR = Path("bot_files")
 WORK_DIR.mkdir(exist_ok=True)
 PERSISTENCE_FILE = "bot_persistence.pkl"
+VIDEO_NOTE_MAX_SECONDS = 60  # ограничение самого Telegram для кружков
 
 # Состояния, которые бот ждёт от пользователя дальше
 STATE_NONE = "none"
@@ -100,11 +103,63 @@ async def recognize_track(file_path: str) -> dict | None:
     return {"title": result.get("title"), "artist": result.get("artist")}
 
 
+async def convert_to_video_note(input_path: str) -> str:
+    """Обрезает видео до квадрата и максимум 60 секунд, кодирует под кружок."""
+    output_path = str(Path(input_path).with_name("video_note.mp4"))
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [
+        ffmpeg, "-y", "-i", input_path,
+        "-t", str(VIDEO_NOTE_MAX_SECONDS),
+        "-vf", "crop='min(iw,ih)':'min(iw,ih)',scale=480:480",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k",
+        output_path,
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(stderr.decode(errors="ignore")[-500:])
+    return output_path
+
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remember_user(update, context)
+    video = update.message.video or update.message.document
+    if video is None:
+        return
+
+    status = await update.message.reply_text("Делаю кружок, подожди немного...")
+
+    user_dir = WORK_DIR / str(update.effective_user.id)
+    user_dir.mkdir(exist_ok=True)
+    input_path = user_dir / "input_video.mp4"
+
+    tg_file = await context.bot.get_file(video.file_id)
+    await tg_file.download_to_drive(custom_path=str(input_path))
+
+    try:
+        output_path = await convert_to_video_note(str(input_path))
+    except Exception as e:
+        logger.exception("Ошибка конвертации видео в кружок")
+        await status.edit_text(
+            "Не получилось сделать кружок. Проверь, что видео не слишком тяжёлое "
+            f"и в обычном формате.\n\nОшибка: {e}"
+        )
+        return
+
+    await status.edit_text("Готово! Отправляю кружок...")
+    with open(output_path, "rb") as f:
+        await context.bot.send_video_note(chat_id=update.effective_chat.id, video_note=f)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remember_user(update, context)
     await update.message.reply_text(
-        "Привет! Пришли мне аудиофайл (mp3, flac или m4a), "
-        "и я помогу поменять у него название, исполнителя и обложку."
+        "Привет! Пришли мне аудиофайл (mp3, flac или m4a) — помогу поменять "
+        "название, исполнителя и обложку.\n\n"
+        "Или пришли видео — сделаю из него кружок (video note)."
     )
 
 
@@ -116,6 +171,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. Кнопками выбери, что поменять: название, исполнителя, обложку\n"
         "3. Пришли новое значение (текст или фото)\n"
         "4. Нажми «Готово» — получишь файл с новыми тегами\n\n"
+        "Пришли видео — сделаю из него кружок (video note), "
+        "максимум 60 секунд, автоматически обрежется до квадрата.\n\n"
         "Чтобы можно было постить сразу на свой канал:\n"
         "/setchannel — привязать канал\n"
         "/mychannel — посмотреть, какой канал сейчас привязан\n\n"
@@ -561,6 +618,7 @@ def main():
     app.add_handler(CommandHandler("mychannel", cmd_mychannel))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded_channel))
