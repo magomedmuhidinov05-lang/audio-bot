@@ -81,6 +81,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         buttons.append(
             [InlineKeyboardButton("🔍 Определить трек по звуку", callback_data="recognize")]
         )
+    buttons.append([InlineKeyboardButton("🎙 Сделать голосовым", callback_data="make_voice")])
     buttons.append([InlineKeyboardButton("✅ Готово, отправить файл", callback_data="finish")])
     return InlineKeyboardMarkup(buttons)
 
@@ -101,6 +102,46 @@ async def recognize_track(file_path: str) -> dict | None:
     if not result:
         return None
     return {"title": result.get("title"), "artist": result.get("artist")}
+
+
+async def convert_to_voice(input_path: str) -> str:
+    """Конвертирует аудио в формат Telegram-голосового (OGG/Opus, моно)."""
+    output_path = str(Path(input_path).with_name("voice.ogg"))
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [
+        ffmpeg, "-y", "-i", input_path,
+        "-ac", "1",
+        "-c:a", "libopus", "-b:a", "64k",
+        output_path,
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(stderr.decode(errors="ignore")[-500:])
+    return output_path
+
+
+async def handle_make_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
+    file_path = context.user_data.get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        await query.edit_message_text("Файл не найден, пришли аудио заново.")
+        return
+
+    await query.edit_message_text("Делаю голосовое, подожди немного...")
+    try:
+        output_path = await convert_to_voice(file_path)
+    except Exception as e:
+        logger.exception("Ошибка конвертации в голосовое")
+        await query.edit_message_text(
+            f"Не получилось сделать голосовое: {e}", reply_markup=main_menu_keyboard()
+        )
+        return
+
+    await query.edit_message_text("Готово! Отправляю голосовое...")
+    with open(output_path, "rb") as f:
+        await context.bot.send_voice(chat_id=update.effective_chat.id, voice=f)
 
 
 async def convert_to_video_note(input_path: str) -> str:
@@ -250,7 +291,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "1. Пришли аудиофайл (mp3, flac или m4a)\n"
         "2. Кнопками выбери, что поменять: название, исполнителя, обложку\n"
         "3. Пришли новое значение (текст или фото)\n"
-        "4. Нажми «Готово» — получишь файл с новыми тегами\n\n"
+        "4. Нажми «Готово» — получишь файл с новыми тегами\n"
+        "Кнопка «Сделать голосовым» превратит аудио в голосовое сообщение.\n\n"
         "Пришли видео — предложу сделать кружок или вытащить из него звук "
         "(кружок — максимум 60 секунд, автоматически обрежется до квадрата).\n"
         "Пришли готовый кружок — сразу вытащу из него звук отдельным файлом.\n\n"
@@ -418,6 +460,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_to_channel(update, context, query)
     elif query.data == "recognize":
         await handle_recognize(update, context, query)
+    elif query.data == "make_voice":
+        await handle_make_voice(update, context, query)
     elif query.data in ("video_to_circle", "video_extract_audio"):
         await handle_video_choice(update, context, query)
 
