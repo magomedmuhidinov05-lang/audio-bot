@@ -19,7 +19,13 @@ import logging
 import subprocess
 from pathlib import Path
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+    BotCommandScopeChat,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -58,6 +64,7 @@ STATE_TITLE = "title"
 STATE_ARTIST = "artist"
 STATE_COVER = "cover"
 STATE_SET_CHANNEL = "set_channel"
+STATE_BROADCAST = "broadcast_wait"
 
 
 def remember_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -339,11 +346,20 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ADMIN_ID or str(update.effective_user.id) != str(ADMIN_ID):
         return  # не админ — тихо игнорируем, чтобы не палить наличие команды
 
+    # можно по-старому: /broadcast текст сообщения — сработает сразу
     text = update.message.text.partition(" ")[2].strip()
-    if not text:
-        await update.message.reply_text("Использование: /broadcast текст сообщения")
+    if text:
+        await run_broadcast(update, context, text)
         return
 
+    # без текста — просто нажали кнопку/команду, спрашиваем текст следующим сообщением
+    context.user_data["state"] = STATE_BROADCAST
+    await update.message.reply_text(
+        "Напиши сообщение, которое разослать всем пользователям (или /cancel, чтобы отменить)."
+    )
+
+
+async def run_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     known_users = context.bot_data.get("known_users", set())
     if not known_users:
         await update.message.reply_text("Пока нет ни одного известного пользователя.")
@@ -503,6 +519,11 @@ async def handle_recognize(update: Update, context: ContextTypes.DEFAULT_TYPE, q
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("state", STATE_NONE)
+
+    if state == STATE_BROADCAST:
+        context.user_data["state"] = STATE_NONE
+        await run_broadcast(update, context, update.message.text)
+        return
 
     if state == STATE_TITLE:
         context.user_data["new_title"] = update.message.text
@@ -712,15 +733,24 @@ async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def setup_commands(application: Application):
-    await application.bot.set_my_commands(
-        [
-            BotCommand("start", "Начать / отправить новый файл"),
-            BotCommand("help", "Как пользоваться ботом"),
-            BotCommand("cancel", "Отменить текущую операцию"),
-            BotCommand("setchannel", "Привязать свой канал"),
-            BotCommand("mychannel", "Какой канал привязан сейчас"),
-        ]
-    )
+    default_commands = [
+        BotCommand("start", "Начать / отправить новый файл"),
+        BotCommand("help", "Как пользоваться ботом"),
+        BotCommand("cancel", "Отменить текущую операцию"),
+        BotCommand("setchannel", "Привязать свой канал"),
+        BotCommand("mychannel", "Какой канал привязан сейчас"),
+    ]
+    await application.bot.set_my_commands(default_commands)
+
+    if ADMIN_ID:
+        try:
+            admin_chat_id = int(ADMIN_ID)
+            await application.bot.set_my_commands(
+                default_commands + [BotCommand("broadcast", "Разослать сообщение всем")],
+                scope=BotCommandScopeChat(chat_id=admin_chat_id),
+            )
+        except Exception:
+            logger.exception("Не удалось задать персональное меню команд для ADMIN_ID")
 
 
 def main():
