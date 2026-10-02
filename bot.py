@@ -124,13 +124,30 @@ async def convert_to_video_note(input_path: str) -> str:
     return output_path
 
 
+async def extract_audio(input_path: str) -> str:
+    """Вытаскивает звуковую дорожку из видео/кружка в mp3."""
+    output_path = str(Path(input_path).with_name("extracted_audio.mp3"))
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [
+        ffmpeg, "-y", "-i", input_path,
+        "-vn",  # без видео
+        "-c:a", "libmp3lame", "-q:a", "2",
+        output_path,
+    ]
+    process = await asyncio.create_subprocess_exec(
+        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+    )
+    _, stderr = await process.communicate()
+    if process.returncode != 0:
+        raise RuntimeError(stderr.decode(errors="ignore")[-500:])
+    return output_path
+
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remember_user(update, context)
     video = update.message.video or update.message.document
     if video is None:
         return
-
-    status = await update.message.reply_text("Делаю кружок, подожди немного...")
 
     user_dir = WORK_DIR / str(update.effective_user.id)
     user_dir.mkdir(exist_ok=True)
@@ -138,20 +155,82 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     tg_file = await context.bot.get_file(video.file_id)
     await tg_file.download_to_drive(custom_path=str(input_path))
+    context.user_data["video_path"] = str(input_path)
 
-    try:
-        output_path = await convert_to_video_note(str(input_path))
-    except Exception as e:
-        logger.exception("Ошибка конвертации видео в кружок")
-        await status.edit_text(
-            "Не получилось сделать кружок. Проверь, что видео не слишком тяжёлое "
-            f"и в обычном формате.\n\nОшибка: {e}"
-        )
+    await update.message.reply_text(
+        "Видео получено! Что сделать?",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔵 Сделать кружок", callback_data="video_to_circle")],
+                [InlineKeyboardButton("🎵 Извлечь аудио", callback_data="video_extract_audio")],
+            ]
+        ),
+    )
+
+
+async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    remember_user(update, context)
+    video_note = update.message.video_note
+    if video_note is None:
         return
 
-    await status.edit_text("Готово! Отправляю кружок...")
+    status = await update.message.reply_text("Извлекаю звук из кружка...")
+
+    user_dir = WORK_DIR / str(update.effective_user.id)
+    user_dir.mkdir(exist_ok=True)
+    input_path = user_dir / "input_circle.mp4"
+
+    tg_file = await context.bot.get_file(video_note.file_id)
+    await tg_file.download_to_drive(custom_path=str(input_path))
+
+    try:
+        output_path = await extract_audio(str(input_path))
+    except Exception as e:
+        logger.exception("Ошибка извлечения звука из кружка")
+        await status.edit_text(f"Не получилось извлечь звук: {e}")
+        return
+
+    await status.edit_text("Готово! Отправляю аудио...")
     with open(output_path, "rb") as f:
-        await context.bot.send_video_note(chat_id=update.effective_chat.id, video_note=f)
+        await context.bot.send_audio(chat_id=update.effective_chat.id, audio=f, filename="audio.mp3")
+
+
+async def handle_video_choice(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
+    input_path = context.user_data.get("video_path")
+    if not input_path or not os.path.exists(input_path):
+        await query.edit_message_text("Видео не найдено, пришли заново.")
+        return
+
+    if query.data == "video_to_circle":
+        await query.edit_message_text("Делаю кружок, подожди немного...")
+        try:
+            output_path = await convert_to_video_note(input_path)
+        except Exception as e:
+            logger.exception("Ошибка конвертации видео в кружок")
+            await query.edit_message_text(
+                "Не получилось сделать кружок. Проверь, что видео не слишком "
+                f"тяжёлое и в обычном формате.\n\nОшибка: {e}"
+            )
+            return
+        await query.edit_message_text("Готово! Отправляю кружок...")
+        with open(output_path, "rb") as f:
+            await context.bot.send_video_note(chat_id=update.effective_chat.id, video_note=f)
+
+    elif query.data == "video_extract_audio":
+        await query.edit_message_text("Извлекаю звук из видео...")
+        try:
+            output_path = await extract_audio(input_path)
+        except Exception as e:
+            logger.exception("Ошибка извлечения звука из видео")
+            await query.edit_message_text(f"Не получилось извлечь звук: {e}")
+            return
+        await query.edit_message_text("Готово! Отправляю аудио...")
+        with open(output_path, "rb") as f:
+            await context.bot.send_audio(
+                chat_id=update.effective_chat.id, audio=f, filename="audio.mp3"
+            )
+
+    context.user_data.pop("video_path", None)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -159,7 +238,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Пришли мне аудиофайл (mp3, flac или m4a) — помогу поменять "
         "название, исполнителя и обложку.\n\n"
-        "Или пришли видео — сделаю из него кружок (video note)."
+        "Или пришли видео/кружок — сделаю из видео кружок, либо вытащу звук "
+        "из видео или кружка отдельным файлом."
     )
 
 
@@ -171,8 +251,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. Кнопками выбери, что поменять: название, исполнителя, обложку\n"
         "3. Пришли новое значение (текст или фото)\n"
         "4. Нажми «Готово» — получишь файл с новыми тегами\n\n"
-        "Пришли видео — сделаю из него кружок (video note), "
-        "максимум 60 секунд, автоматически обрежется до квадрата.\n\n"
+        "Пришли видео — предложу сделать кружок или вытащить из него звук "
+        "(кружок — максимум 60 секунд, автоматически обрежется до квадрата).\n"
+        "Пришли готовый кружок — сразу вытащу из него звук отдельным файлом.\n\n"
         "Чтобы можно было постить сразу на свой канал:\n"
         "/setchannel — привязать канал\n"
         "/mychannel — посмотреть, какой канал сейчас привязан\n\n"
@@ -317,7 +398,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if "file_path" not in context.user_data and query.data != "send_channel":
+    no_file_ok = query.data in ("send_channel", "video_to_circle", "video_extract_audio")
+    if "file_path" not in context.user_data and not no_file_ok:
         await query.edit_message_text("Сначала пришли аудиофайл командой /start.")
         return
 
@@ -336,6 +418,8 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_to_channel(update, context, query)
     elif query.data == "recognize":
         await handle_recognize(update, context, query)
+    elif query.data in ("video_to_circle", "video_extract_audio"):
+        await handle_video_choice(update, context, query)
 
 
 async def handle_recognize(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
@@ -619,6 +703,7 @@ def main():
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
+    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
     app.add_handler(CallbackQueryHandler(handle_button))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded_channel))
