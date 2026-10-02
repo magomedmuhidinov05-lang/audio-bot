@@ -769,19 +769,23 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-    app.add_handler(CommandHandler("setchannel", cmd_setchannel))
-    app.add_handler(CommandHandler("mychannel", cmd_mychannel))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(MessageHandler(filters.AUDIO | filters.Document.AUDIO, handle_audio))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
-    app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
+    # Бот реагирует только в личных сообщениях — чтобы не отвечать на
+    # комментарии в привязанной к каналу группе обсуждений и подобное
+    private = filters.ChatType.PRIVATE
+
+    app.add_handler(CommandHandler("start", start, filters=private))
+    app.add_handler(CommandHandler("help", help_command, filters=private))
+    app.add_handler(CommandHandler("cancel", cmd_cancel, filters=private))
+    app.add_handler(CommandHandler("setchannel", cmd_setchannel, filters=private))
+    app.add_handler(CommandHandler("mychannel", cmd_mychannel, filters=private))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast, filters=private))
+    app.add_handler(MessageHandler(private & (filters.AUDIO | filters.Document.AUDIO), handle_audio))
+    app.add_handler(MessageHandler(private & (filters.VIDEO | filters.Document.VIDEO), handle_video))
+    app.add_handler(MessageHandler(private & filters.VIDEO_NOTE, handle_video_note))
     app.add_handler(CallbackQueryHandler(handle_button))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.FORWARDED, handle_forwarded_channel))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(private & filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(private & filters.FORWARDED, handle_forwarded_channel))
+    app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, handle_text))
 
     webhook_url = os.environ.get("WEBHOOK_URL", "").rstrip("/")
     if webhook_url:
