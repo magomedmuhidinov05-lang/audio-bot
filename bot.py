@@ -43,6 +43,7 @@ from mutagen.mp4 import MP4, MP4Cover
 from PIL import Image
 import httpx
 import imageio_ffmpeg
+import asyncpg
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -53,10 +54,88 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 AUDD_API_TOKEN = os.environ.get("AUDD_API_TOKEN", "")  # ключ с audd.io, для распознавания треков
 ADMIN_ID = os.environ.get("ADMIN_ID", "")  # твой Telegram user id — для /broadcast
+DATABASE_URL = os.environ.get("DATABASE_URL", "")  # строка подключения к Postgres (Neon и т.п.)
 WORK_DIR = Path("bot_files")
 WORK_DIR.mkdir(exist_ok=True)
 PERSISTENCE_FILE = "bot_persistence.pkl"
 VIDEO_NOTE_MAX_SECONDS = 60  # ограничение самого Telegram для кружков
+
+db_pool = None  # пул соединений с базой, создаётся при старте, если задан DATABASE_URL
+
+
+async def init_db():
+    """Создаёт пул соединений и таблицу, если указана DATABASE_URL.
+    Без неё бот работает как раньше, просто без надёжной памяти между перезапусками."""
+    global db_pool
+    if not DATABASE_URL:
+        logger.info("DATABASE_URL не задан — привязки каналов не переживут перезапуск.")
+        return
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                channel_id BIGINT,
+                channel_title TEXT
+            )
+            """
+        )
+    logger.info("Подключение к базе данных установлено.")
+
+
+async def db_remember_user(user_id: int):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+            user_id,
+        )
+
+
+async def db_set_channel(user_id: int, channel_id: int, channel_title: str):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO users (user_id, channel_id, channel_title)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE SET channel_id = $2, channel_title = $3
+            """,
+            user_id, channel_id, channel_title,
+        )
+
+
+async def db_get_channel(user_id: int):
+    if not db_pool:
+        return None
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT channel_id, channel_title FROM users WHERE user_id = $1", user_id
+        )
+    if row and row["channel_id"]:
+        return row["channel_id"], row["channel_title"]
+    return None
+
+
+async def db_get_all_users():
+    if not db_pool:
+        return []
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM users")
+    return [r["user_id"] for r in rows]
+
+
+async def get_user_channel(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Канал пользователя: сперва из кэша в памяти (user_data), иначе из базы."""
+    if "channel_id" in context.user_data:
+        return context.user_data.get("channel_id"), context.user_data.get("channel_title")
+    result = await db_get_channel(user_id)
+    if result:
+        context.user_data["channel_id"], context.user_data["channel_title"] = result
+    return result or (None, None)
 
 # Состояния, которые бот ждёт от пользователя дальше
 STATE_NONE = "none"
@@ -67,13 +146,15 @@ STATE_SET_CHANNEL = "set_channel"
 STATE_BROADCAST = "broadcast_wait"
 
 
-def remember_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Запоминает user_id в общем хранилище бота, чтобы потом можно было
-    сделать рассылку всем, кто хоть раз писал боту."""
+async def remember_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запоминает user_id — в памяти (на время работы процесса) и в базе
+    (переживает перезапуск/сон), чтобы потом можно было сделать рассылку
+    всем, кто хоть раз писал боту."""
     if not update.effective_user:
         return
     known = context.bot_data.setdefault("known_users", set())
     known.add(update.effective_user.id)
+    await db_remember_user(update.effective_user.id)
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
@@ -192,7 +273,7 @@ async def extract_audio(input_path: str) -> str:
 
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remember_user(update, context)
+    await remember_user(update, context)
     video = update.message.video or update.message.document
     if video is None:
         return
@@ -217,7 +298,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remember_user(update, context)
+    await remember_user(update, context)
     video_note = update.message.video_note
     if video_note is None:
         return
@@ -282,7 +363,7 @@ async def handle_video_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remember_user(update, context)
+    await remember_user(update, context)
     await update.message.reply_text(
         "Привет! Пришли мне аудиофайл (mp3, flac или m4a) — помогу поменять "
         "название, исполнителя и обложку.\n\n"
@@ -292,7 +373,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remember_user(update, context)
+    await remember_user(update, context)
     await update.message.reply_text(
         "Как пользоваться:\n"
         "1. Пришли аудиофайл (mp3, flac или m4a)\n"
@@ -333,7 +414,7 @@ async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_mychannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    channel_title = context.user_data.get("channel_title")
+    _, channel_title = await get_user_channel(update.effective_user.id, context)
     if channel_title:
         await update.message.reply_text(f"Привязан канал: {channel_title}")
     else:
@@ -360,7 +441,11 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def run_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    known_users = context.bot_data.get("known_users", set())
+    known_users = set(context.bot_data.get("known_users", set()))
+    try:
+        known_users |= set(await db_get_all_users())
+    except Exception:
+        logger.exception("Не удалось получить список пользователей из базы")
     if not known_users:
         await update.message.reply_text("Пока нет ни одного известного пользователя.")
         return
@@ -405,11 +490,12 @@ async def handle_forwarded_channel(update: Update, context: ContextTypes.DEFAULT
     context.user_data["channel_id"] = chat.id
     context.user_data["channel_title"] = chat.title
     context.user_data["state"] = STATE_NONE
+    await db_set_channel(update.effective_user.id, chat.id, chat.title)
     await update.message.reply_text(f"Готово! Канал «{chat.title}» привязан ✅")
 
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    remember_user(update, context)
+    await remember_user(update, context)
     audio = update.message.audio or update.message.document
     if audio is None:
         await update.message.reply_text("Не вижу аудиофайл, попробуй ещё раз.")
@@ -633,7 +719,7 @@ def make_thumbnail(cover_path: str) -> str:
 
 async def send_to_channel(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
     file_id = context.user_data.get("last_file_id")
-    channel_id = context.user_data.get("channel_id")
+    channel_id, _ = await get_user_channel(update.effective_user.id, context)
 
     if not file_id:
         await query.edit_message_text("Файл не найден, пришли аудио заново.")
@@ -710,7 +796,8 @@ async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE
             if thumb_file:
                 thumb_file.close()
 
-    if context.user_data.get("channel_id"):
+    channel_id, _ = await get_user_channel(update.effective_user.id, context)
+    if channel_id:
         # сохраняем file_id готового файла, чтобы отправить его в канал без
         # повторной загрузки, если пользователь нажмёт кнопку ниже
         context.user_data["last_file_id"] = sent_message.audio.file_id
@@ -753,6 +840,11 @@ async def setup_commands(application: Application):
             logger.exception("Не удалось задать персональное меню команд для ADMIN_ID")
 
 
+async def post_init(application: Application):
+    await init_db()
+    await setup_commands(application)
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit(
@@ -765,7 +857,7 @@ def main():
         Application.builder()
         .token(BOT_TOKEN)
         .persistence(persistence)
-        .post_init(setup_commands)
+        .post_init(post_init)
         .build()
     )
 
