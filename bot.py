@@ -44,6 +44,11 @@ from PIL import Image
 import httpx
 import imageio_ffmpeg
 import asyncpg
+import uvicorn
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import PlainTextResponse, Response
+from starlette.routing import Route
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -844,6 +849,49 @@ async def post_init(application: Application):
     await init_db()
     await setup_commands(application)
 
+    webhook_url = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+    if webhook_url:
+        await application.bot.set_webhook(
+            url=f"{webhook_url}/{BOT_TOKEN}",
+            secret_token=os.environ.get("WEBHOOK_SECRET") or None,
+        )
+
+
+async def run_with_webhook(application: Application, port: int):
+    """Свой маленький веб-сервер поверх вебхука: кроме приёма обновлений
+    от Telegram, отвечает 'OK' на обычный запрос к корню сайта — это
+    нужно, чтобы внешний пинг-сервис (UptimeRobot и т.п.) не получал 404
+    и не давал Render усыплять бесплатный сервис."""
+    secret = os.environ.get("WEBHOOK_SECRET") or None
+
+    async def telegram_webhook(request: Request) -> Response:
+        if secret and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != secret:
+            return Response(status_code=401)
+        data = await request.json()
+        update = Update.de_json(data=data, bot=application.bot)
+        await application.update_queue.put(update)
+        return Response()
+
+    async def health(_: Request) -> PlainTextResponse:
+        return PlainTextResponse("OK")
+
+    starlette_app = Starlette(
+        routes=[
+            Route(f"/{BOT_TOKEN}", telegram_webhook, methods=["POST"]),
+            Route("/", health, methods=["GET"]),
+            Route("/healthcheck", health, methods=["GET"]),
+        ]
+    )
+
+    async with application:
+        await application.start()
+        server = uvicorn.Server(
+            uvicorn.Config(app=starlette_app, host="0.0.0.0", port=port, log_level="warning")
+        )
+        logger.info("Бот запущен через webhook (с health-check для пинг-сервиса)")
+        await server.serve()
+        await application.stop()
+
 
 def main():
     if not BOT_TOKEN:
@@ -882,14 +930,7 @@ def main():
     webhook_url = os.environ.get("WEBHOOK_URL", "").rstrip("/")
     if webhook_url:
         port = int(os.environ.get("PORT", 8080))
-        logger.info("Бот запущен через webhook: %s", webhook_url)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{webhook_url}/{BOT_TOKEN}",
-            secret_token=os.environ.get("WEBHOOK_SECRET") or None,
-        )
+        asyncio.run(run_with_webhook(app, port))
     else:
         logger.info("Бот запущен через polling (WEBHOOK_URL не задан)...")
         app.run_polling()
