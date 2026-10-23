@@ -1,7 +1,6 @@
 """
-Telegram-бот для редактирования тегов аудио (название, исполнитель, обложка).
-
-Поддерживаемые форматы: MP3, FLAC, M4A/MP4.
+Telegram-бот для редактирования тегов аудио (название, исполнитель, обложка),
+создания кружков/голосовых из видео и аудио, и постинга на канал пользователя.
 
 Установка:
     pip install -r requirements.txt
@@ -16,7 +15,6 @@ Telegram-бот для редактирования тегов аудио (на�
 import os
 import asyncio
 import logging
-import subprocess
 from pathlib import Path
 
 from telegram import (
@@ -36,7 +34,6 @@ from telegram.ext import (
     PicklePersistence,
 )
 
-from mutagen.mp3 import MP3
 from mutagen.id3 import ID3, TIT2, TPE1, APIC, ID3NoHeaderError
 from mutagen.flac import FLAC, Picture
 from mutagen.mp4 import MP4, MP4Cover
@@ -65,15 +62,26 @@ WORK_DIR.mkdir(exist_ok=True)
 PERSISTENCE_FILE = "bot_persistence.pkl"
 VIDEO_NOTE_MAX_SECONDS = 60  # ограничение самого Telegram для кружков
 
+# Состояния, которые бот ждёт от пользователя дальше
+STATE_NONE = "none"
+STATE_TITLE = "title"
+STATE_ARTIST = "artist"
+STATE_COVER = "cover"
+STATE_SET_CHANNEL = "set_channel"
+STATE_BROADCAST = "broadcast_wait"
+STATE_TEMPLATE_NAME = "template_name"
+
 db_pool = None  # пул соединений с базой, создаётся при старте, если задан DATABASE_URL
 
 
+# ──────────────────────────── База данных ────────────────────────────
+
 async def init_db():
-    """Создаёт пул соединений и таблицу, если указана DATABASE_URL.
+    """Создаёт пул соединений и таблицы, если указана DATABASE_URL.
     Без неё бот работает как раньше, просто без надёжной памяти между перезапусками."""
     global db_pool
     if not DATABASE_URL:
-        logger.info("DATABASE_URL не задан — привязки каналов не переживут перезапуск.")
+        logger.info("DATABASE_URL не задан — привязки каналов и шаблоны не переживут перезапуск.")
         return
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
     async with db_pool.acquire() as conn:
@@ -83,6 +91,18 @@ async def init_db():
                 user_id BIGINT PRIMARY KEY,
                 channel_id BIGINT,
                 channel_title TEXT
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS templates (
+                user_id BIGINT,
+                name TEXT,
+                title TEXT,
+                artist TEXT,
+                cover BYTEA,
+                PRIMARY KEY (user_id, name)
             )
             """
         )
@@ -133,6 +153,51 @@ async def db_get_all_users():
     return [r["user_id"] for r in rows]
 
 
+async def db_save_template(user_id: int, name: str, title, artist, cover_bytes):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO templates (user_id, name, title, artist, cover)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (user_id, name)
+            DO UPDATE SET title = $3, artist = $4, cover = $5
+            """,
+            user_id, name, title, artist, cover_bytes,
+        )
+
+
+async def db_list_templates(user_id: int):
+    if not db_pool:
+        return []
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT name FROM templates WHERE user_id = $1 ORDER BY name", user_id
+        )
+    return [r["name"] for r in rows]
+
+
+async def db_get_template(user_id: int, name: str):
+    if not db_pool:
+        return None
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT title, artist, cover FROM templates WHERE user_id = $1 AND name = $2",
+            user_id, name,
+        )
+    if not row:
+        return None
+    return row["title"], row["artist"], row["cover"]
+
+
+async def db_delete_template(user_id: int, name: str):
+    if not db_pool:
+        return
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM templates WHERE user_id = $1 AND name = $2", user_id, name
+        )
+
+
 async def get_user_channel(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     """Канал пользователя: сперва из кэша в памяти (user_data), иначе из базы."""
     if "channel_id" in context.user_data:
@@ -141,14 +206,6 @@ async def get_user_channel(user_id: int, context: ContextTypes.DEFAULT_TYPE):
     if result:
         context.user_data["channel_id"], context.user_data["channel_title"] = result
     return result or (None, None)
-
-# Состояния, которые бот ждёт от пользователя дальше
-STATE_NONE = "none"
-STATE_TITLE = "title"
-STATE_ARTIST = "artist"
-STATE_COVER = "cover"
-STATE_SET_CHANNEL = "set_channel"
-STATE_BROADCAST = "broadcast_wait"
 
 
 async def remember_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -161,6 +218,8 @@ async def remember_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     known.add(update.effective_user.id)
     await db_remember_user(update.effective_user.id)
 
+
+# ──────────────────────────── Клавиатуры ────────────────────────────
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     buttons = [
@@ -175,9 +234,23 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🔍 Определить трек по звуку", callback_data="recognize")]
         )
     buttons.append([InlineKeyboardButton("🎙 Сделать голосовым", callback_data="make_voice")])
+    if db_pool:
+        buttons.append(
+            [InlineKeyboardButton("💾 Сохранить как шаблон", callback_data="save_template")]
+        )
     buttons.append([InlineKeyboardButton("✅ Готово, отправить файл", callback_data="finish")])
     return InlineKeyboardMarkup(buttons)
 
+
+def templates_keyboard(names: list) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(f"📄 {name}", callback_data=f"use_template:{name}")]
+        for name in names
+    ]
+    return InlineKeyboardMarkup(buttons)
+
+
+# ──────────────────────────── Распознавание трека ────────────────────────────
 
 async def recognize_track(file_path: str) -> dict | None:
     """Отправляет аудио в AudD.io и возвращает {'title':..., 'artist':...} или None."""
@@ -196,6 +269,352 @@ async def recognize_track(file_path: str) -> dict | None:
         return None
     return {"title": result.get("title"), "artist": result.get("artist")}
 
+
+# ──────────────────────────── Команды ────────────────────────────
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await remember_user(update, context)
+    await update.message.reply_text(
+        "Привет! Пришли мне аудиофайл (mp3, flac или m4a) — помогу поменять "
+        "название, исполнителя и обложку.\n\n"
+        "Или пришли видео/кружок — сделаю из видео кружок, либо вытащу звук "
+        "из видео или кружка отдельным файлом."
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await remember_user(update, context)
+    await update.message.reply_text(
+        "Как пользоваться:\n"
+        "1. Пришли аудиофайл (mp3, flac или m4a)\n"
+        "2. Кнопками выбери, что поменять: название, исполнителя, обложку\n"
+        "3. Пришли новое значение (текст или фото)\n"
+        "4. Нажми «Готово» — получишь файл с новыми тегами\n"
+        "Кнопка «Сделать голосовым» превратит аудио в голосовое сообщение.\n\n"
+        "Пришли видео — предложу сделать кружок или вытащить из него звук "
+        "(кружок — максимум 60 секунд, автоматически обрежется до квадрата).\n"
+        "Пришли готовый кружок — сразу вытащу из него звук отдельным файлом.\n\n"
+        "Шаблоны — сохрани часто используемые название/исполнителя/обложку "
+        "кнопкой «Сохранить как шаблон», а потом применяй командой /templates.\n\n"
+        "Чтобы можно было постить сразу на свой канал:\n"
+        "/setchannel — привязать канал\n"
+        "/mychannel — посмотреть, какой канал сейчас привязан\n\n"
+        "/cancel — отменить текущую операцию"
+    )
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    had_file = "file_path" in context.user_data
+    for key in (
+        "file_path", "ext", "new_title", "new_artist", "cover_path",
+        "state", "last_file_id", "last_title", "last_artist",
+        "original_title", "original_artist", "video_path",
+    ):
+        context.user_data.pop(key, None)
+    if had_file:
+        await update.message.reply_text("Отменено. Можешь прислать новый файл.")
+    else:
+        await update.message.reply_text("Отменять нечего, но состояние на всякий случай сброшено.")
+
+
+async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["state"] = STATE_SET_CHANNEL
+    await update.message.reply_text(
+        "1. Добавь этого бота администратором в свой канал (с правом публикации постов)\n"
+        "2. Перешли мне сюда любое сообщение из этого канала — я запомню его"
+    )
+
+
+async def cmd_mychannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _, channel_title = await get_user_channel(update.effective_user.id, context)
+    if channel_title:
+        await update.message.reply_text(f"Привязан канал: {channel_title}")
+    else:
+        await update.message.reply_text(
+            "Канал ещё не привязан. Используй /setchannel, чтобы привязать."
+        )
+
+
+async def cmd_templates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not db_pool:
+        await update.message.reply_text(
+            "Шаблоны работают только при подключённой базе данных (DATABASE_URL)."
+        )
+        return
+    names = await db_list_templates(update.effective_user.id)
+    if not names:
+        await update.message.reply_text(
+            "У тебя пока нет сохранённых шаблонов. Сохрани один кнопкой "
+            "«💾 Сохранить как шаблон» во время редактирования файла."
+        )
+        return
+    await update.message.reply_text(
+        "Твои шаблоны — выбери, какой применить к текущему файлу:",
+        reply_markup=templates_keyboard(names),
+    )
+
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not ADMIN_ID or str(update.effective_user.id) != str(ADMIN_ID):
+        return  # не админ — тихо игнорируем, чтобы не палить наличие команды
+
+    text = update.message.text.partition(" ")[2].strip()
+    if text:
+        await run_broadcast(update, context, text)
+        return
+
+    context.user_data["state"] = STATE_BROADCAST
+    await update.message.reply_text(
+        "Напиши сообщение, которое разослать всем пользователям (или /cancel, чтобы отменить)."
+    )
+
+
+async def run_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    known_users = set(context.bot_data.get("known_users", set()))
+    try:
+        known_users |= set(await db_get_all_users())
+    except Exception:
+        logger.exception("Не удалось получить список пользователей из базы")
+    if not known_users:
+        await update.message.reply_text("Пока нет ни одного известного пользователя.")
+        return
+
+    sent, failed = 0, 0
+    status = await update.message.reply_text(f"Рассылаю {len(known_users)} пользователям...")
+    for user_id in list(known_users):
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text)
+            sent += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    await status.edit_text(f"Готово: доставлено {sent}, не доставлено {failed}.")
+
+
+async def handle_forwarded_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("state") != STATE_SET_CHANNEL:
+        return
+
+    origin = update.message.forward_origin
+    if origin is None or origin.type != "channel":
+        await update.message.reply_text(
+            "Это не похоже на пересланное сообщение из канала. Попробуй ещё раз."
+        )
+        return
+
+    chat = origin.chat
+
+    try:
+        member = await context.bot.get_chat_member(chat.id, context.bot.id)
+        if member.status not in ("administrator", "creator"):
+            raise ValueError("not admin")
+    except Exception:
+        await update.message.reply_text(
+            "Не вижу бота среди администраторов этого канала. "
+            "Добавь его туда с правом публикации и попробуй снова."
+        )
+        return
+
+    context.user_data["channel_id"] = chat.id
+    context.user_data["channel_title"] = chat.title
+    context.user_data["state"] = STATE_NONE
+    await db_set_channel(update.effective_user.id, chat.id, chat.title)
+    await update.message.reply_text(f"Готово! Канал «{chat.title}» привязан ✅")
+
+
+# ──────────────────────────── Приём аудио ────────────────────────────
+
+async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await remember_user(update, context)
+    audio = update.message.audio or update.message.document
+    if audio is None:
+        await update.message.reply_text("Не вижу аудиофайл, попробуй ещё раз.")
+        return
+
+    file_name = audio.file_name or f"{audio.file_unique_id}.mp3"
+    ext = Path(file_name).suffix.lower()
+    if ext not in (".mp3", ".flac", ".m4a", ".mp4"):
+        await update.message.reply_text(
+            "Пока поддерживаю только mp3, flac и m4a. Пришли файл в одном из этих форматов."
+        )
+        return
+
+    user_dir = WORK_DIR / str(update.effective_user.id)
+    user_dir.mkdir(exist_ok=True)
+    local_path = user_dir / f"current{ext}"
+
+    tg_file = await context.bot.get_file(audio.file_id)
+    await tg_file.download_to_drive(custom_path=str(local_path))
+
+    orig_title = None
+    orig_artist = None
+    if update.message.audio:
+        orig_title = update.message.audio.title
+        orig_artist = update.message.audio.performer
+
+    context.user_data["file_path"] = str(local_path)
+    context.user_data["ext"] = ext
+    context.user_data["state"] = STATE_NONE
+    context.user_data["new_title"] = None
+    context.user_data["new_artist"] = None
+    context.user_data["cover_path"] = None
+    context.user_data["original_title"] = orig_title
+    context.user_data["original_artist"] = orig_artist
+
+    await update.message.reply_text(
+        "Файл получен! Что меняем?", reply_markup=main_menu_keyboard()
+    )
+
+
+# ──────────────────────────── Кнопки ────────────────────────────
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    no_file_ok = query.data in (
+        "send_channel", "video_to_circle", "video_extract_audio",
+    ) or query.data.startswith("use_template:")
+    if "file_path" not in context.user_data and not no_file_ok:
+        await query.edit_message_text("Сначала пришли аудиофайл командой /start.")
+        return
+
+    if query.data == "set_title":
+        context.user_data["state"] = STATE_TITLE
+        await query.edit_message_text("Пришли новое название трека текстом.")
+    elif query.data == "set_artist":
+        context.user_data["state"] = STATE_ARTIST
+        await query.edit_message_text("Пришли имя исполнителя текстом.")
+    elif query.data == "set_cover":
+        context.user_data["state"] = STATE_COVER
+        await query.edit_message_text("Пришли фото для обложки.")
+    elif query.data == "finish":
+        await apply_tags_and_send(update, context, query)
+    elif query.data == "send_channel":
+        await send_to_channel(update, context, query)
+    elif query.data == "recognize":
+        await handle_recognize(update, context, query)
+    elif query.data == "make_voice":
+        await handle_make_voice(update, context, query)
+    elif query.data == "save_template":
+        await handle_save_template_start(update, context, query)
+    elif query.data.startswith("use_template:"):
+        await handle_use_template(update, context, query)
+    elif query.data in ("video_to_circle", "video_extract_audio"):
+        await handle_video_choice(update, context, query)
+
+
+async def handle_recognize(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
+    file_path = context.user_data.get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        await query.edit_message_text("Файл не найден, пришли аудио заново.")
+        return
+
+    await query.edit_message_text("Слушаю трек, определяю...")
+    try:
+        result = await recognize_track(file_path)
+    except Exception as e:
+        logger.exception("Ошибка распознавания трека")
+        await query.edit_message_text(
+            f"Не получилось распознать трек: {e}", reply_markup=main_menu_keyboard()
+        )
+        return
+
+    if not result:
+        await query.edit_message_text(
+            "Не удалось распознать этот трек. Можешь ввести название и исполнителя вручную.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    if result.get("title"):
+        context.user_data["new_title"] = result["title"]
+    if result.get("artist"):
+        context.user_data["new_artist"] = result["artist"]
+
+    await query.edit_message_text(
+        f"Похоже, это:\n«{result.get('title')}» — {result.get('artist')}\n\n"
+        "Уже подставил в название и исполнителя. Можешь поправить или нажать «Готово».",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+# ──────────────────────────── Шаблоны ────────────────────────────
+
+async def handle_save_template_start(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
+    if not db_pool:
+        await query.edit_message_text(
+            "Шаблоны работают только при подключённой базе данных (DATABASE_URL).",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+    context.user_data["state"] = STATE_TEMPLATE_NAME
+    await query.edit_message_text(
+        "Как назвать этот шаблон? (например: «Мой канал» или «Нашиды с подписью»)"
+    )
+
+
+async def save_template_finish(update: Update, context: ContextTypes.DEFAULT_TYPE, name: str):
+    user_id = update.effective_user.id
+    title = context.user_data.get("new_title")
+    artist = context.user_data.get("new_artist")
+    cover_path = context.user_data.get("cover_path")
+
+    if not title and not artist and not cover_path:
+        await update.message.reply_text(
+            "Пока нечего сохранять — сначала укажи название, исполнителя или обложку.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    cover_bytes = None
+    if cover_path and os.path.exists(cover_path):
+        with open(cover_path, "rb") as f:
+            cover_bytes = f.read()
+
+    await db_save_template(user_id, name, title, artist, cover_bytes)
+    context.user_data["state"] = STATE_NONE
+    await update.message.reply_text(
+        f"Шаблон «{name}» сохранён ✅ Применить его позже можно командой /templates.",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+async def handle_use_template(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
+    name = query.data.partition(":")[2]
+    file_path = context.user_data.get("file_path")
+    if not file_path or not os.path.exists(file_path):
+        await query.edit_message_text(
+            "Сначала пришли аудиофайл, к которому применить шаблон."
+        )
+        return
+
+    template = await db_get_template(update.effective_user.id, name)
+    if not template:
+        await query.edit_message_text("Шаблон не найден — возможно, он был удалён.")
+        return
+
+    title, artist, cover_bytes = template
+    if title:
+        context.user_data["new_title"] = title
+    if artist:
+        context.user_data["new_artist"] = artist
+    if cover_bytes:
+        user_dir = WORK_DIR / str(update.effective_user.id)
+        user_dir.mkdir(exist_ok=True)
+        cover_path = user_dir / "cover.jpg"
+        with open(cover_path, "wb") as f:
+            f.write(cover_bytes)
+        context.user_data["cover_path"] = str(cover_path)
+
+    await query.edit_message_text(
+        f"Применил шаблон «{name}». Можешь поправить что-то ещё или нажать «Готово».",
+        reply_markup=main_menu_keyboard(),
+    )
+
+
+# ──────────────────────────── Видео / кружки ────────────────────────────
 
 async def convert_to_voice(input_path: str) -> str:
     """Конвертирует аудио в формат Telegram-голосового (OGG/Opus, моно)."""
@@ -238,7 +657,6 @@ async def handle_make_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 
 async def convert_to_video_note(input_path: str) -> str:
-    """Обрезает видео до квадрата и максимум 60 секунд, кодирует под кружок."""
     output_path = str(Path(input_path).with_name("video_note.mp4"))
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [
@@ -259,12 +677,11 @@ async def convert_to_video_note(input_path: str) -> str:
 
 
 async def extract_audio(input_path: str) -> str:
-    """Вытаскивает звуковую дорожку из видео/кружка в mp3."""
     output_path = str(Path(input_path).with_name("extracted_audio.mp3"))
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     cmd = [
         ffmpeg, "-y", "-i", input_path,
-        "-vn",  # без видео
+        "-vn",
         "-c:a", "libmp3lame", "-q:a", "2",
         output_path,
     ]
@@ -367,246 +784,7 @@ async def handle_video_choice(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data.pop("video_path", None)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await remember_user(update, context)
-    await update.message.reply_text(
-        "Привет! Пришли мне аудиофайл (mp3, flac или m4a) — помогу поменять "
-        "название, исполнителя и обложку.\n\n"
-        "Или пришли видео/кружок — сделаю из видео кружок, либо вытащу звук "
-        "из видео или кружка отдельным файлом."
-    )
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await remember_user(update, context)
-    await update.message.reply_text(
-        "Как пользоваться:\n"
-        "1. Пришли аудиофайл (mp3, flac или m4a)\n"
-        "2. Кнопками выбери, что поменять: название, исполнителя, обложку\n"
-        "3. Пришли новое значение (текст или фото)\n"
-        "4. Нажми «Готово» — получишь файл с новыми тегами\n"
-        "Кнопка «Сделать голосовым» превратит аудио в голосовое сообщение.\n\n"
-        "Пришли видео — предложу сделать кружок или вытащить из него звук "
-        "(кружок — максимум 60 секунд, автоматически обрежется до квадрата).\n"
-        "Пришли готовый кружок — сразу вытащу из него звук отдельным файлом.\n\n"
-        "Чтобы можно было постить сразу на свой канал:\n"
-        "/setchannel — привязать канал\n"
-        "/mychannel — посмотреть, какой канал сейчас привязан\n\n"
-        "/cancel — отменить текущую операцию"
-    )
-
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    had_file = "file_path" in context.user_data
-    for key in (
-        "file_path", "ext", "new_title", "new_artist", "cover_path",
-        "state", "last_file_id", "last_title", "last_artist",
-        "original_title", "original_artist",
-    ):
-        context.user_data.pop(key, None)
-    if had_file:
-        await update.message.reply_text("Отменено. Можешь прислать новый файл.")
-    else:
-        await update.message.reply_text("Отменять нечего, но состояние на всякий случай сброшено.")
-
-
-async def cmd_setchannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["state"] = STATE_SET_CHANNEL
-    await update.message.reply_text(
-        "1. Добавь этого бота администратором в свой канал (с правом публикации постов)\n"
-        "2. Перешли мне сюда любое сообщение из этого канала — я запомню его"
-    )
-
-
-async def cmd_mychannel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _, channel_title = await get_user_channel(update.effective_user.id, context)
-    if channel_title:
-        await update.message.reply_text(f"Привязан канал: {channel_title}")
-    else:
-        await update.message.reply_text(
-            "Канал ещё не привязан. Используй /setchannel, чтобы привязать."
-        )
-
-
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not ADMIN_ID or str(update.effective_user.id) != str(ADMIN_ID):
-        return  # не админ — тихо игнорируем, чтобы не палить наличие команды
-
-    # можно по-старому: /broadcast текст сообщения — сработает сразу
-    text = update.message.text.partition(" ")[2].strip()
-    if text:
-        await run_broadcast(update, context, text)
-        return
-
-    # без текста — просто нажали кнопку/команду, спрашиваем текст следующим сообщением
-    context.user_data["state"] = STATE_BROADCAST
-    await update.message.reply_text(
-        "Напиши сообщение, которое разослать всем пользователям (или /cancel, чтобы отменить)."
-    )
-
-
-async def run_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    known_users = set(context.bot_data.get("known_users", set()))
-    try:
-        known_users |= set(await db_get_all_users())
-    except Exception:
-        logger.exception("Не удалось получить список пользователей из базы")
-    if not known_users:
-        await update.message.reply_text("Пока нет ни одного известного пользователя.")
-        return
-
-    sent, failed = 0, 0
-    status = await update.message.reply_text(f"Рассылаю {len(known_users)} пользователям...")
-    for user_id in list(known_users):
-        try:
-            await context.bot.send_message(chat_id=user_id, text=text)
-            sent += 1
-        except Exception:
-            failed += 1
-        await asyncio.sleep(0.05)  # чтобы не упереться в лимиты Telegram
-
-    await status.edit_text(f"Готово: доставлено {sent}, не доставлено {failed}.")
-
-
-async def handle_forwarded_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get("state") != STATE_SET_CHANNEL:
-        return  # не в процессе привязки канала — игнорируем
-
-    origin = update.message.forward_origin
-    if origin is None or origin.type != "channel":
-        await update.message.reply_text(
-            "Это не похоже на пересланное сообщение из канала. Попробуй ещё раз."
-        )
-        return
-
-    chat = origin.chat
-
-    try:
-        member = await context.bot.get_chat_member(chat.id, context.bot.id)
-        if member.status not in ("administrator", "creator"):
-            raise ValueError("not admin")
-    except Exception:
-        await update.message.reply_text(
-            "Не вижу бота среди администраторов этого канала. "
-            "Добавь его туда с правом публикации и попробуй снова."
-        )
-        return
-
-    context.user_data["channel_id"] = chat.id
-    context.user_data["channel_title"] = chat.title
-    context.user_data["state"] = STATE_NONE
-    await db_set_channel(update.effective_user.id, chat.id, chat.title)
-    await update.message.reply_text(f"Готово! Канал «{chat.title}» привязан ✅")
-
-
-async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await remember_user(update, context)
-    audio = update.message.audio or update.message.document
-    if audio is None:
-        await update.message.reply_text("Не вижу аудиофайл, попробуй ещё раз.")
-        return
-
-    file_name = audio.file_name or f"{audio.file_unique_id}.mp3"
-    ext = Path(file_name).suffix.lower()
-    if ext not in (".mp3", ".flac", ".m4a", ".mp4"):
-        await update.message.reply_text(
-            "Пока поддерживаю только mp3, flac и m4a. Пришли файл в одном из этих форматов."
-        )
-        return
-
-    user_dir = WORK_DIR / str(update.effective_user.id)
-    user_dir.mkdir(exist_ok=True)
-    local_path = user_dir / f"current{ext}"
-
-    tg_file = await context.bot.get_file(audio.file_id)
-    await tg_file.download_to_drive(custom_path=str(local_path))
-
-    # Запоминаем оригинальные название/исполнителя (Telegram хранит их отдельно
-    # от самого файла), чтобы не терять их, если пользователь меняет только обложку
-    orig_title = None
-    orig_artist = None
-    if update.message.audio:
-        orig_title = update.message.audio.title
-        orig_artist = update.message.audio.performer
-
-    context.user_data["file_path"] = str(local_path)
-    context.user_data["ext"] = ext
-    context.user_data["state"] = STATE_NONE
-    context.user_data["new_title"] = None
-    context.user_data["new_artist"] = None
-    context.user_data["cover_path"] = None
-    context.user_data["original_title"] = orig_title
-    context.user_data["original_artist"] = orig_artist
-
-    await update.message.reply_text(
-        "Файл получен! Что меняем?", reply_markup=main_menu_keyboard()
-    )
-
-
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    no_file_ok = query.data in ("send_channel", "video_to_circle", "video_extract_audio")
-    if "file_path" not in context.user_data and not no_file_ok:
-        await query.edit_message_text("Сначала пришли аудиофайл командой /start.")
-        return
-
-    if query.data == "set_title":
-        context.user_data["state"] = STATE_TITLE
-        await query.edit_message_text("Пришли новое название трека текстом.")
-    elif query.data == "set_artist":
-        context.user_data["state"] = STATE_ARTIST
-        await query.edit_message_text("Пришли имя исполнителя текстом.")
-    elif query.data == "set_cover":
-        context.user_data["state"] = STATE_COVER
-        await query.edit_message_text("Пришли фото для обложки.")
-    elif query.data == "finish":
-        await apply_tags_and_send(update, context, query)
-    elif query.data == "send_channel":
-        await send_to_channel(update, context, query)
-    elif query.data == "recognize":
-        await handle_recognize(update, context, query)
-    elif query.data == "make_voice":
-        await handle_make_voice(update, context, query)
-    elif query.data in ("video_to_circle", "video_extract_audio"):
-        await handle_video_choice(update, context, query)
-
-
-async def handle_recognize(update: Update, context: ContextTypes.DEFAULT_TYPE, query):
-    file_path = context.user_data.get("file_path")
-    if not file_path or not os.path.exists(file_path):
-        await query.edit_message_text("Файл не найден, пришли аудио заново.")
-        return
-
-    await query.edit_message_text("Слушаю трек, определяю...")
-    try:
-        result = await recognize_track(file_path)
-    except Exception as e:
-        logger.exception("Ошибка распознавания трека")
-        await query.edit_message_text(
-            f"Не получилось распознать трек: {e}", reply_markup=main_menu_keyboard()
-        )
-        return
-
-    if not result:
-        await query.edit_message_text(
-            "Не удалось распознать этот трек. Можешь ввести название и исполнителя вручную.",
-            reply_markup=main_menu_keyboard(),
-        )
-        return
-
-    if result.get("title"):
-        context.user_data["new_title"] = result["title"]
-    if result.get("artist"):
-        context.user_data["new_artist"] = result["artist"]
-
-    await query.edit_message_text(
-        f"Похоже, это:\n«{result.get('title')}» — {result.get('artist')}\n\n"
-        "Уже подставил в название и исполнителя. Можешь поправить или нажать «Готово».",
-        reply_markup=main_menu_keyboard(),
-    )
-
+# ──────────────────────────── Текст / фото ────────────────────────────
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("state", STATE_NONE)
@@ -614,6 +792,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state == STATE_BROADCAST:
         context.user_data["state"] = STATE_NONE
         await run_broadcast(update, context, update.message.text)
+        return
+
+    if state == STATE_TEMPLATE_NAME:
+        context.user_data["state"] = STATE_NONE
+        await save_template_finish(update, context, update.message.text.strip())
         return
 
     if state == STATE_TITLE:
@@ -643,7 +826,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    photo = update.message.photo[-1]  # самое большое разрешение
+    photo = update.message.photo[-1]
     tg_file = await context.bot.get_file(photo.file_id)
 
     user_dir = WORK_DIR / str(update.effective_user.id)
@@ -654,6 +837,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["state"] = STATE_NONE
     await update.message.reply_text("Обложка сохранена.", reply_markup=main_menu_keyboard())
 
+
+# ──────────────────────────── Теги аудио ────────────────────────────
 
 def apply_mp3_tags(path: str, title, artist, cover_path):
     try:
@@ -674,7 +859,7 @@ def apply_mp3_tags(path: str, title, artist, cover_path):
                 APIC(
                     encoding=3,
                     mime="image/jpeg",
-                    type=3,  # обложка альбома
+                    type=3,
                     desc="Cover",
                     data=img.read(),
                 )
@@ -712,8 +897,6 @@ def apply_mp4_tags(path: str, title, artist, cover_path):
 
 
 def make_thumbnail(cover_path: str) -> str:
-    """Делает уменьшенную JPEG-версию обложки (до 320x320, <200 КБ) —
-    именно такую картинку Telegram показывает как превью аудио в чате."""
     thumb_path = str(Path(cover_path).with_name("thumb.jpg"))
     with Image.open(cover_path) as img:
         img = img.convert("RGB")
@@ -756,8 +939,6 @@ async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE
     ext = context.user_data.get("ext")
     cover_path = context.user_data.get("cover_path")
 
-    # Если пользователь не менял название/исполнителя — сохраняем оригинальные
-    # значения (Telegram хранит их отдельно от самого файла), а не теряем их
     title = context.user_data.get("new_title") or context.user_data.get("original_title")
     artist = context.user_data.get("new_artist") or context.user_data.get("original_artist")
 
@@ -803,8 +984,6 @@ async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     channel_id, _ = await get_user_channel(update.effective_user.id, context)
     if channel_id:
-        # сохраняем file_id готового файла, чтобы отправить его в канал без
-        # повторной загрузки, если пользователь нажмёт кнопку ниже
         context.user_data["last_file_id"] = sent_message.audio.file_id
         context.user_data["last_title"] = title
         context.user_data["last_artist"] = artist
@@ -816,13 +995,14 @@ async def apply_tags_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE
             ),
         )
 
-    # очистка состояния пользователя (кроме last_* — они нужны для кнопки канала)
     for key in (
         "file_path", "ext", "new_title", "new_artist", "cover_path", "state",
         "original_title", "original_artist",
     ):
         context.user_data.pop(key, None)
 
+
+# ──────────────────────────── Запуск ────────────────────────────
 
 async def setup_commands(application: Application):
     default_commands = [
@@ -831,6 +1011,7 @@ async def setup_commands(application: Application):
         BotCommand("cancel", "Отменить текущую операцию"),
         BotCommand("setchannel", "Привязать свой канал"),
         BotCommand("mychannel", "Какой канал привязан сейчас"),
+        BotCommand("templates", "Применить сохранённый шаблон"),
     ]
     await application.bot.set_my_commands(default_commands)
 
@@ -918,6 +1099,7 @@ def main():
     app.add_handler(CommandHandler("cancel", cmd_cancel, filters=private))
     app.add_handler(CommandHandler("setchannel", cmd_setchannel, filters=private))
     app.add_handler(CommandHandler("mychannel", cmd_mychannel, filters=private))
+    app.add_handler(CommandHandler("templates", cmd_templates, filters=private))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast, filters=private))
     app.add_handler(MessageHandler(private & (filters.AUDIO | filters.Document.AUDIO), handle_audio))
     app.add_handler(MessageHandler(private & (filters.VIDEO | filters.Document.VIDEO), handle_video))
